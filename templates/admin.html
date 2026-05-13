@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin Panel</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0f172a; color:#e2e8f0; margin:0; padding:24px; }
+    .wrap { max-width:760px; margin:0 auto; }
+    .card { background:#111827; border:1px solid #334155; border-radius:12px; padding:16px; margin-bottom:14px; }
+    input, select, button { width:100%; padding:10px; border-radius:8px; border:1px solid #475569; background:#0b1220; color:#e2e8f0; margin-top:8px; }
+    button { background:#2563eb; border:none; cursor:pointer; font-weight:700; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .err { color:#f87171; }
+    .ok { color:#4ade80; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom:1px solid #334155; text-align:left; padding:8px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Admin Panel</h1>
+
+  {% if error %}<p class="err">{{ error }}</p>{% endif %}
+  {% if message %}<p class="ok">{{ message }}</p>{% endif %}
+
+  {% if not authorized %}
+  <div class="card">
+    <form method="post" action="/admin">
+      <label>Введите пароль администратора</label>
+      <input type="password" name="password" required placeholder="Пароль">
+      <button type="submit" name="action" value="login">Войти</button>
+    </form>
+  </div>
+  {% else %}
+  <div class="card">
+    <h3>Токены по регионам</h3>
+    <table>
+      <thead><tr><th>Регион</th><th>Аккаунтов</th></tr></thead>
+      <tbody>
+      {% for server, count in token_counts.items() %}
+      <tr><td>{{ server }}</td><td>{{ count }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Добавить аккаунт</h3>
+    <form method="post" action="/admin">
+      <input type="hidden" name="password" value="{{ admin_password }}">
+      <div class="row">
+        <input name="uid" placeholder="UID" required>
+        <input name="pass" placeholder="Password" required>
+      </div>
+      <select name="region" required>
+        {% for s in ["CIS","BR","US","SAC","NA","BD","RU"] %}
+        <option value="{{ s }}">{{ s }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" name="action" value="add_account">Добавить</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Кэш лайков</h3>
+    <form method="post" action="/admin">
+      <input type="hidden" name="password" value="{{ admin_password }}">
+      <button type="submit" name="action" value="reset_cache">Очистить кэш</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+</body>
+</html>
