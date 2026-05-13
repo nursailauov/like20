@@ -17,12 +17,14 @@ import random
 import os
 import urllib.parse
 import tempfile
+import hmac
 
 app = Flask(__name__)
 
 KEY_LIMIT = 100          # ← change to e.g. 500 if you want more likes per IP per day
 ADMIN_PASSWORD = "nurx222"
 KEYS_FILE = os.environ.get("KEYS_FILE", "api_keys.json")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 tracker = defaultdict(lambda: [0, time.time()])
 liked_cache = defaultdict(set)
 key_tracker = defaultdict(lambda: [0, time.time()])
@@ -50,6 +52,20 @@ def reset_key_usage(target_key=None):
             keys_to_delete.append(tracker_key)
     for item in keys_to_delete:
         key_tracker.pop(item, None)
+
+def run_scheduled_tasks():
+    keys_data = load_api_keys()
+    changed = []
+    for key_name, info in keys_data.items():
+        if key_name == "nur":
+            continue
+        if is_key_expired(info) and not info.get("disabled", False):
+            info["disabled"] = True
+            changed.append(key_name)
+    if changed:
+        save_api_keys(keys_data)
+        notify_event("keys_auto_disabled", {"keys": changed})
+    return {"auto_disabled": changed, "count": len(changed)}
 
 def load_api_keys():
     default_data = {"nur": {"limit": 100, "disabled": False, "expires_at": None}}
@@ -84,6 +100,18 @@ def save_api_keys(keys_data):
             last_error = e
     print(f"⚠️ Could not save api keys: {last_error}")
     return False
+
+def notify_event(event_type, payload):
+    if not WEBHOOK_URL:
+        return
+    try:
+        requests.post(WEBHOOK_URL, json={"event": event_type, "payload": payload}, timeout=5)
+    except Exception:
+        pass
+
+def check_admin_api_auth(req):
+    pwd = req.headers.get("X-Admin-Password", "")
+    return hmac.compare_digest(pwd, ADMIN_PASSWORD)
 
 def is_key_expired(key_info):
     expires_at = key_info.get("expires_at")
@@ -328,6 +356,8 @@ def handle_requests():
         if like_given > 0:
             key_tracker[tracker_key][0] += 1
         remains = key_limit - key_tracker[tracker_key][0]
+        if remains in {10, 5, 1, 0}:
+            notify_event("key_limit_warning", {"key": key, "remaining": remains, "limit": key_limit, "ip": client_ip})
         return jsonify({
             "LikesGivenByAPI": like_given,
             "LikesafterCommand": after_like,
@@ -385,6 +415,7 @@ def admin_panel():
                     keys_data[new_key] = {"limit": int(new_limit), "disabled": False, "expires_at": expires_at}
                     if save_api_keys(keys_data):
                         message = f'Ключ {new_key} сохранен'
+                        notify_event("key_created", {"key": new_key, "limit": int(new_limit), "expires_at": expires_at})
                     else:
                         error = 'Не удалось сохранить ключ (read-only fs)'
             elif action == 'delete_key':
@@ -396,6 +427,7 @@ def admin_panel():
                     del keys_data[delete_key]
                     if save_api_keys(keys_data):
                         message = f'Ключ {delete_key} удален'
+                        notify_event("key_deleted", {"key": delete_key})
                     else:
                         error = 'Не удалось удалить ключ (read-only fs)'
                 else:
@@ -413,6 +445,7 @@ def admin_panel():
                         keys_data[target_key]["expires_at"] = expires_at
                     if save_api_keys(keys_data):
                         message = f'Лимит ключа {target_key} обновлен'
+                        notify_event("key_updated", {"key": target_key, "limit": int(new_limit), "expires_at": keys_data[target_key].get("expires_at")})
                     else:
                         error = 'Не удалось сохранить новый лимит'
             elif action == 'toggle_key':
@@ -428,6 +461,7 @@ def admin_panel():
                     if save_api_keys(keys_data):
                         state = "отключен" if keys_data[target_key]["disabled"] else "включен"
                         message = f'Ключ {target_key} {state}'
+                        notify_event("key_toggled", {"key": target_key, "disabled": keys_data[target_key]["disabled"]})
                     else:
                         error = 'Не удалось изменить статус ключа'
             elif action == 'reset_key_usage':
@@ -463,6 +497,70 @@ def admin_panel():
             "expires_at": info.get("expires_at")
         }
     return render_template('admin.html', authorized=authorized, error=error, message=message, token_counts=token_counts, api_keys=keys_data, key_stats=key_stats, admin_password=password if authorized else '')
+
+@app.route('/admin/run-scheduled', methods=['POST'])
+def admin_run_scheduled():
+    password = request.form.get("password") or request.headers.get("X-Admin-Password", "")
+    if password != ADMIN_PASSWORD:
+        return jsonify({"error": "Unauthorized"}), 403
+    return jsonify({"status": "ok", "result": run_scheduled_tasks()})
+
+@app.route('/api/keys', methods=['GET', 'POST'])
+def api_keys_collection():
+    if not check_admin_api_auth(request):
+        return jsonify({"error": "Unauthorized"}), 403
+    keys_data = load_api_keys()
+    if request.method == 'GET':
+        usage_today = get_key_usage_today()
+        result = {}
+        for key_name, info in keys_data.items():
+            limit = int(info.get("limit", KEY_LIMIT))
+            used = int(usage_today.get(key_name, 0))
+            result[key_name] = {
+                "limit": limit,
+                "used": used,
+                "remaining": max(limit - used, 0),
+                "disabled": bool(info.get("disabled", False)),
+                "expires_at": info.get("expires_at"),
+                "expired": is_key_expired(info),
+            }
+        return jsonify(result)
+    data = request.get_json(silent=True) or {}
+    key_name = (data.get("key") or "").strip()
+    limit = int(data.get("limit", KEY_LIMIT))
+    expires_at = data.get("expires_at")
+    if not key_name:
+        return jsonify({"error": "key required"}), 400
+    keys_data[key_name] = {"limit": limit, "disabled": False, "expires_at": expires_at}
+    if not save_api_keys(keys_data):
+        return jsonify({"error": "cannot save keys"}), 500
+    notify_event("key_created", {"key": key_name, "limit": limit, "expires_at": expires_at})
+    return jsonify({"status": "created", "key": key_name})
+
+@app.route('/api/keys/<key_name>', methods=['PATCH', 'DELETE'])
+def api_key_item(key_name):
+    if not check_admin_api_auth(request):
+        return jsonify({"error": "Unauthorized"}), 403
+    keys_data = load_api_keys()
+    if key_name not in keys_data:
+        return jsonify({"error": "not found"}), 404
+    if request.method == 'DELETE':
+        if key_name == "nur":
+            return jsonify({"error": "cannot delete base key"}), 400
+        del keys_data[key_name]
+        save_api_keys(keys_data)
+        notify_event("key_deleted", {"key": key_name})
+        return jsonify({"status": "deleted", "key": key_name})
+    data = request.get_json(silent=True) or {}
+    if "limit" in data:
+        keys_data[key_name]["limit"] = int(data["limit"])
+    if "disabled" in data:
+        keys_data[key_name]["disabled"] = bool(data["disabled"])
+    if "expires_at" in data:
+        keys_data[key_name]["expires_at"] = data["expires_at"]
+    save_api_keys(keys_data)
+    notify_event("key_updated", {"key": key_name, **data})
+    return jsonify({"status": "updated", "key": key_name, "data": keys_data[key_name]})
 
 @app.route('/token_info', methods=['GET'])
 def token_info():
