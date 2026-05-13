@@ -23,9 +23,6 @@ app = Flask(__name__)
 KEY_LIMIT = 100          # ← change to e.g. 500 if you want more likes per IP per day
 ADMIN_PASSWORD = "nurx222"
 KEYS_FILE = os.environ.get("KEYS_FILE", "api_keys.json")
-TELEGRAM_ADMIN_IDS = {
-    x.strip() for x in os.environ.get("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip()
-}
 tracker = defaultdict(lambda: [0, time.time()])
 liked_cache = defaultdict(set)
 key_tracker = defaultdict(lambda: [0, time.time()])
@@ -466,13 +463,6 @@ def admin_panel():
             "expires_at": info.get("expires_at")
         }
     return render_template('admin.html', authorized=authorized, error=error, message=message, token_counts=token_counts, api_keys=keys_data, key_stats=key_stats, admin_password=password if authorized else '')
-
-@app.route('/admin/telegram-check', methods=['GET'])
-def telegram_admin_check():
-    telegram_id = (request.args.get("telegram_id") or "").strip()
-    if not telegram_id:
-        return jsonify({"ok": False, "error": "telegram_id required"}), 400
-    return jsonify({"ok": telegram_id in TELEGRAM_ADMIN_IDS, "telegram_id": telegram_id})
 
 @app.route('/token_info', methods=['GET'])
 def token_info():
