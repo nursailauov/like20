@@ -141,6 +141,40 @@ def load_env_accounts(server_name):
     return accounts
 
 
+def get_env_accounts_status():
+    raw = os.environ.get('EXTRA_ACCOUNTS_JSON', '').strip()
+    status = {
+        "present": bool(raw),
+        "length": len(raw),
+        "json_valid": False,
+        "json_type": None,
+        "total_items": 0,
+        "valid_by_region": {},
+        "error": None,
+    }
+    if not raw:
+        return status
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        status["error"] = f"JSON error at char {exc.pos}: {exc.msg}"
+        return status
+
+    status["json_valid"] = True
+    status["json_type"] = type(parsed).__name__
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        status["error"] = "Value must be a JSON object or array"
+        return status
+
+    status["total_items"] = len(parsed)
+    for srv in VALID_SERVERS:
+        status["valid_by_region"][srv] = len(load_env_accounts(srv))
+    return status
+
+
 def load_accounts(server_name):
     filename = get_region_filename(server_name)
     if not os.path.exists(filename):
@@ -429,6 +463,14 @@ def token_info():
         count = len(load_accounts(srv))
         data[srv] = {"regular_tokens": count, "visit_tokens": 0}
     return jsonify(data)
+
+
+@app.route('/env_debug', methods=['GET'])
+def env_debug():
+    key = request.args.get("key")
+    if key != "nur":
+        return jsonify({"error": "Invalid key"}), 403
+    return jsonify(get_env_accounts_status())
 
 
 @app.route('/add_account', methods=['GET', 'POST'])
