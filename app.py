@@ -52,19 +52,86 @@ def get_region_filename(server_name):
     return "account_bd.txt"
 
 
-def read_accounts_file(filename):
+def account_identity(account):
+    return str(account.get('uid') or account.get('account_id') or account.get('open_id') or '')
+
+
+def parse_json_account(raw, server_name):
+    try:
+        account = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(account, dict):
+        return None
+
+    region = str(account.get('region', server_name)).upper()
+    if region and region != server_name:
+        return None
+
+    uid = str(account.get('uid') or account.get('account_id') or '').strip()
+    password = str(account.get('password') or account.get('pass') or '').strip()
+    token = str(account.get('access_token') or account.get('token') or account.get('jwt_token') or '').strip()
+    open_id = str(account.get('open_id') or '').strip()
+
+    if not uid and not open_id:
+        return None
+    if token:
+        return {
+            "uid": uid or open_id,
+            "account_id": uid,
+            "open_id": open_id,
+            "account_name": account.get('account_name'),
+            "platform": account.get('platform'),
+            "region": region,
+            "access_token": token,
+        }
+    if uid and password:
+        return {"uid": uid, "password": password, "region": region}
+    return None
+
+
+def read_accounts_file(filename, server_name):
     accounts = []
     with open(filename, "r") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
+            if line.startswith('{'):
+                account = parse_json_account(line, server_name)
+                if account:
+                    accounts.append(account)
+                continue
             if ':' in line:
                 uid, pwd = line.split(':', 1)
                 uid = uid.strip()
                 pwd = pwd.strip()
                 if uid and pwd:
-                    accounts.append({"uid": uid, "password": pwd})
+                    accounts.append({"uid": uid, "password": pwd, "region": server_name})
+    return accounts
+
+
+def load_env_accounts(server_name):
+    raw = os.environ.get('EXTRA_ACCOUNTS_JSON', '').strip()
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+
+    accounts = []
+    for item in parsed:
+        account = parse_json_account(json.dumps(item), server_name)
+        if account:
+            accounts.append(account)
     return accounts
 
 
@@ -76,15 +143,16 @@ def load_accounts(server_name):
 
     now = time.time()
     mtime = os.path.getmtime(filename)
+    env_accounts = load_env_accounts(server_name)
     cached = account_cache.get(filename)
     if cached:
         cached_mtime, expires_at, accounts = cached
         if cached_mtime == mtime and expires_at > now:
-            return accounts
+            return accounts + env_accounts
 
-    accounts = read_accounts_file(filename)
+    accounts = read_accounts_file(filename, server_name)
     account_cache[filename] = (mtime, now + ACCOUNT_CACHE_TTL, accounts)
-    return accounts
+    return accounts + env_accounts
 
 
 def clear_account_cache(server_name=None):
@@ -136,6 +204,18 @@ async def generate_jwt_token(uid, password, session):
         return None
 
 
+async def resolve_account_token(account, session):
+    token = account.get('access_token') or account.get('token') or account.get('jwt_token')
+    if token:
+        return token
+
+    uid = account.get('uid')
+    password = account.get('password')
+    if not uid or not password:
+        return None
+    return await generate_jwt_token(uid, password, session)
+
+
 def encrypt_message(plaintext):
     key = b'Yg&tc%DEuh6%Zc^8'
     iv = b'6oyZDr22E3ychjM%'
@@ -163,13 +243,14 @@ async def send_like(encrypted_uid, token, url, session):
 
 async def process_account(target_uid, encrypted_uid, account, url, semaphore, session):
     async with semaphore:
-        token = await generate_jwt_token(account['uid'], account['password'], session)
+        token = await resolve_account_token(account, session)
+        identity = account_identity(account)
         if not token:
-            return 500, account['uid']
+            return 500, identity
         status = await send_like(encrypted_uid, token, url, session)
         if status == 200:
-            liked_cache[target_uid].add(account['uid'])
-        return status, account['uid']
+            liked_cache[target_uid].add(identity)
+        return status, identity
 
 
 async def send_all_likes(target_uid, server_name, url, session):
@@ -180,7 +261,7 @@ async def send_all_likes(target_uid, server_name, url, session):
         return {'success': 0, 'failed': 0, 'total': 0, 'already_liked': 0}
 
     already_liked = liked_cache.get(target_uid, set())
-    fresh_accounts = [acc for acc in accounts if acc['uid'] not in already_liked]
+    fresh_accounts = [acc for acc in accounts if account_identity(acc) not in already_liked]
 
     if not fresh_accounts:
         return {'success': 0, 'failed': 0, 'total': len(accounts), 'already_liked': len(already_liked), 'fresh_used': 0}
@@ -240,7 +321,7 @@ async def get_player_info_async(encrypted_uid, server_name, token, session):
 
 
 async def generate_check_token(accounts, session):
-    tasks = [generate_jwt_token(acc['uid'], acc['password'], session) for acc in accounts[:5]]
+    tasks = [resolve_account_token(acc, session) for acc in accounts[:5]]
     for task in asyncio.as_completed(tasks):
         token = await task
         if token:
