@@ -5,7 +5,6 @@ from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
 import binascii
 import aiohttp
-import requests
 import json
 import like_pb2
 import like_count_pb2
@@ -21,11 +20,14 @@ app = Flask(__name__)
 
 KEY_LIMIT = 100          # change to e.g. 500 if you want more likes per IP per day
 JWT_CACHE_TTL = 6 * 60 * 60
+ACCOUNT_CACHE_TTL = 60
+VALID_SERVERS = ["CIS", "BR", "US", "SAC", "NA", "BD", "RU"]
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=24, connect=8, sock_read=16)
 LIKE_TIMEOUT = aiohttp.ClientTimeout(total=8, connect=4, sock_read=5)
 tracker = defaultdict(lambda: [0, time.time()])
 liked_cache = defaultdict(set)
 jwt_cache = {}
+account_cache = {}
 
 COMMON_HEADERS = {
     'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -45,18 +47,12 @@ def get_region_filename(server_name):
     """Return filename based on server region"""
     if server_name == "CIS":
         return "account_cis.txt"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
+    if server_name in {"BR", "US", "SAC", "NA"}:
         return "account_br.txt"
-    else:  # BD, RU, etc.
-        return "account_bd.txt"
+    return "account_bd.txt"
 
 
-def load_accounts(server_name):
-    filename = get_region_filename(server_name)
-    if not os.path.exists(filename):
-        print(f"WARNING: {filename} not found, creating empty.")
-        open(filename, 'w').close()
-        return []
+def read_accounts_file(filename):
     accounts = []
     with open(filename, "r") as f:
         for line in f:
@@ -65,8 +61,37 @@ def load_accounts(server_name):
                 continue
             if ':' in line:
                 uid, pwd = line.split(':', 1)
-                accounts.append({"uid": uid.strip(), "password": pwd.strip()})
+                uid = uid.strip()
+                pwd = pwd.strip()
+                if uid and pwd:
+                    accounts.append({"uid": uid, "password": pwd})
     return accounts
+
+
+def load_accounts(server_name):
+    filename = get_region_filename(server_name)
+    if not os.path.exists(filename):
+        print(f"WARNING: {filename} not found, creating empty.")
+        open(filename, 'w').close()
+
+    now = time.time()
+    mtime = os.path.getmtime(filename)
+    cached = account_cache.get(filename)
+    if cached:
+        cached_mtime, expires_at, accounts = cached
+        if cached_mtime == mtime and expires_at > now:
+            return accounts
+
+    accounts = read_accounts_file(filename)
+    account_cache[filename] = (mtime, now + ACCOUNT_CACHE_TTL, accounts)
+    return accounts
+
+
+def clear_account_cache(server_name=None):
+    if server_name:
+        account_cache.pop(get_region_filename(server_name), None)
+    else:
+        account_cache.clear()
 
 
 def save_account_to_file(uid, password, server_name):
@@ -75,6 +100,7 @@ def save_account_to_file(uid, password, server_name):
     with open(filename, "a") as f:
         f.write(f"{uid}:{password}\n")
     jwt_cache.pop((uid, password), None)
+    account_cache.pop(filename, None)
     return filename
 
 
@@ -147,8 +173,7 @@ async def process_account(target_uid, encrypted_uid, account, url, semaphore, se
 
 
 async def send_all_likes(target_uid, server_name, url, session):
-    region = server_name
-    protobuf_message = create_protobuf_message(target_uid, region)
+    protobuf_message = create_protobuf_message(target_uid, server_name)
     encrypted_uid = encrypt_message(protobuf_message)
     accounts = load_accounts(server_name)
     if not accounts:
@@ -210,16 +235,6 @@ async def get_player_info_async(encrypted_uid, server_name, token, session):
     try:
         async with session.post(get_player_info_url(server_name), data=edata, headers=headers, timeout=HTTP_TIMEOUT) as response:
             return decode_protobuf(await response.read())
-    except Exception:
-        return None
-
-
-def get_player_info(encrypted_uid, server_name, token):
-    edata = bytes.fromhex(encrypted_uid)
-    headers = {**COMMON_HEADERS, 'Authorization': f"Bearer {token}"}
-    try:
-        response = requests.post(get_player_info_url(server_name), data=edata, headers=headers, verify=False, timeout=10)
-        return decode_protobuf(response.content)
     except Exception:
         return None
 
@@ -292,9 +307,8 @@ def handle_requests():
     if not uid or not server_name:
         return jsonify({"error": "uid and server_name required"}), 400
 
-    valid_servers = ["CIS", "BR", "US", "SAC", "NA", "BD", "RU"]
-    if server_name not in valid_servers:
-        return jsonify({"error": f"Invalid server. Use: {valid_servers}"}), 400
+    if server_name not in VALID_SERVERS:
+        return jsonify({"error": f"Invalid server. Use: {VALID_SERVERS}"}), 400
 
     today_midnight = get_today_midnight_timestamp()
     count, last_reset = tracker[client_ip]
@@ -323,9 +337,8 @@ def index():
 
 @app.route('/token_info', methods=['GET'])
 def token_info():
-    servers = ["CIS", "BR", "US", "SAC", "NA", "BD", "RU"]
     data = {}
-    for srv in servers:
+    for srv in VALID_SERVERS:
         count = len(load_accounts(srv))
         data[srv] = {"regular_tokens": count, "visit_tokens": 0}
     return jsonify(data)
@@ -353,9 +366,8 @@ def add_account():
     if not uid or not password or not region:
         return jsonify({"error": "Missing uid, pass, or region"}), 400
 
-    valid_regions = ["CIS", "BR", "US", "SAC", "NA", "BD", "RU"]
-    if region not in valid_regions:
-        return jsonify({"error": f"Invalid region. Use: {valid_regions}"}), 400
+    if region not in VALID_SERVERS:
+        return jsonify({"error": f"Invalid region. Use: {VALID_SERVERS}"}), 400
 
     filename = save_account_to_file(uid, password, region)
     return jsonify({
@@ -372,6 +384,7 @@ def reset_cache():
         return jsonify({"error": "Invalid key"}), 403
     liked_cache.clear()
     jwt_cache.clear()
+    clear_account_cache()
     return jsonify({"message": "Cache cleared", "credit": "@NUR_SAILAUOV"})
 
 
